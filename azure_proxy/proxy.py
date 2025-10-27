@@ -171,6 +171,8 @@ def azure_chat_url(deployment: str) -> str:
 def azure_responses_url(deployment: str) -> str:
     return f"{UPSTREAM_ENDPOINT}/openai/deployments/{deployment}/responses?api-version={UPSTREAM_API_VERSION}"
 
+def azure_embeddings_url(deployment: str) -> str:
+    return f"{UPSTREAM_ENDPOINT}/openai/deployments/{deployment}/embeddings?api-version={UPSTREAM_API_VERSION}"
 
 
 # ==== HTTP klient ====
@@ -392,47 +394,67 @@ async def forward_stream_with_usage(
         async def do_stream(hdrs: dict):
             return client.stream("POST", url, headers=hdrs, json=body)
     
-        async with client.stream("POST", url, headers=headers, json=body) as r:
-            status_code = r.status_code
-            upstream_headers = dict(r.headers)
+        hdrs = headers
+        while True:
+            async with await do_stream(hdrs) as r:
+                status_code = r.status_code
+                upstream_headers = dict(r.headers)
 
-            async for chunk in r.aiter_bytes():
-                # pošli dál
-                usage_counter += len(chunk)
-                yield chunk
+                if status_code in (401, 403) and not had_auth_retry:
+                    had_auth_retry = True
+                    try:
+                        if kv_provider:
+                            await kv_provider.invalidate()
+                        hdrs = await upstream_headers(request, idempotency_key)
+                        continue  # otevři nový stream s čerstvým klíčem
+                    except Exception as _e:
+                        print(f"[AUTH RETRY FAIL] {type(_e).__name__}: {_e}")
 
-                if not parse_responses_usage:
-                    continue
+                if status_code != 200:
+                    # Přečti tělo a vrať jako chybovou odpověď před tím, než bys cokoliv yieldnul.
+                    text = await r.aread()
+                    yield text
+                    break
 
-                # zkus poskládat SSE bloky a číst "data: {...}"
-                try:
-                    text_buf += chunk.decode("utf-8", errors="ignore")
-                except Exception:
-                    continue
 
-                while "\n\n" in text_buf:
-                    block, text_buf = text_buf.split("\n\n", 1)
-                    for line in block.splitlines():
-                        line = line.strip()
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if not payload or payload == "[DONE]":
-                            continue
-                        try:
-                            evt = json.loads(payload)
-                        except Exception:
-                            continue
+                async for chunk in r.aiter_bytes():
+                    # pošli dál
+                    usage_counter += len(chunk)
+                    yield chunk
 
-                        # OpenAI/Azure Responses: zakončovací event nese usage
-                        if isinstance(evt, dict) and evt.get("type") == "response.completed":
-                            explicit_usage = (evt.get("response") or {}).get("usage") or evt.get("usage")
-                            usage_holder = explicit_usage or {"usage_counter": usage_counter}
-                            print(f"[DEBUG] extracted usage from response.completed: {usage_holder}")
-                        # OpenAI Chat stream se zapnutým include_usage: přijde extra blok s "usage"
-                        elif isinstance(evt, dict) and "usage" in evt and isinstance(evt["usage"], dict):
-                            usage_holder = evt["usage"]                            
-                            print(f"[DEBUG] extracted usage from stream chunk: {usage_holder}")
+                    if not parse_responses_usage:
+                        continue
+
+                    # zkus poskládat SSE bloky a číst "data: {...}"
+                    try:
+                        text_buf += chunk.decode("utf-8", errors="ignore")
+                    except Exception:
+                        continue
+
+                    while "\n\n" in text_buf:
+                        block, text_buf = text_buf.split("\n\n", 1)
+                        for line in block.splitlines():
+                            line = line.strip()
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if not payload or payload == "[DONE]":
+                                continue
+                            try:
+                                evt = json.loads(payload)
+                            except Exception:
+                                continue
+
+                            # OpenAI/Azure Responses: zakončovací event nese usage
+                            if isinstance(evt, dict) and evt.get("type") == "response.completed":
+                                explicit_usage = (evt.get("response") or {}).get("usage") or evt.get("usage")
+                                usage_holder = explicit_usage or {"usage_counter": usage_counter}
+                                print(f"[DEBUG] extracted usage from response.completed: {usage_holder}")
+                            # OpenAI Chat stream se zapnutým include_usage: přijde extra blok s "usage"
+                            elif isinstance(evt, dict) and "usage" in evt and isinstance(evt["usage"], dict):
+                                usage_holder = evt["usage"]                            
+                                print(f"[DEBUG] extracted usage from stream chunk: {usage_holder}")
+                break  # úspěšně zpracován status 200, pokračuj ve streamu
 
         # zapiš usage/metu po skončení streamu
         try:
@@ -462,7 +484,12 @@ async def forward_stream_with_usage(
 def should_retry(status: int) -> bool:
     return status in (429, 500, 502, 503, 504)
 
-
+def gen_idempotency_key_embeddings(body: dict) -> str:
+    canonical = json.dumps(
+        {k: body.get(k) for k in ("model", "input", "encoding_format", "dimensions")},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
 
 async def openai_v1_chat_completions_general(
     request: Request, 
@@ -532,6 +559,46 @@ async def openai_v1_chat_completions_general(
         routelabel=routelabel
     )
 
+
+async def openai_v1_embeddings_general(
+    request: Request,
+    deployment: str | None = None,
+    routelabel: str = "openai_v1_embeddings"
+):
+    if not OPENAI_COMPAT_ENABLED:
+        raise HTTPException(status_code=404, detail="OpenAI-compatible mode disabled")
+
+    await require_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # mapování model -> deployment (stejný mechanizmus jako u chatů)
+    model = body.get("model")
+    if model:
+        deployment = resolve_deployment_from_model(model)
+    elif deployment is None:
+        raise HTTPException(status_code=400, detail="Missing 'model' (or explicit deployment)")
+
+    # idempotency (deterministické podle vstupu)
+    idempotency_key = request.headers.get("Idempotency-Key") or gen_idempotency_key_embeddings(body)
+
+    # log + hlavičky
+    print(f"[REQ] EMBEDDINGS -> {deployment} dims={body.get('dimensions')} encoding={body.get('encoding_format')}")
+    headers = await upstream_headers(request, idempotency_key)
+
+    url = azure_embeddings_url(deployment)
+    return await forward_nonstream(
+        request=request,
+        deployment=deployment,
+        url=url,
+        headers=headers,
+        body=body,
+        idempotency_key=idempotency_key,
+        routelabel=routelabel
+    )
+
 # ============= ROUTES =============
 
 async def get_token(
@@ -548,7 +615,7 @@ async def get_token_row(
 ):
     from .DBDefinitions import ApiKeyModel, hash_token
     hashed_token = hash_token(token) if token else None
-    print(f"Looking for token hash: {redact(hashed_token)}")
+    # print(f"Looking for token hash: {redact(hashed_token)}")
     # statement = select(ApiKey)
     # results = await session.execute(statement)
     # for result in results:
@@ -557,19 +624,19 @@ async def get_token_row(
     statement = select(ApiKeyModel).filter_by(key_hash=hashed_token, is_active=True)
     results = await session.execute(statement)
     result = next(results, None)
-    print(f"token: {token}, result: {result}")
+    # print(f"token: {token}, result: {result}")
     if result:
 
-        from sqlalchemy.inspection import inspect as sa_inspect        
+        # from sqlalchemy.inspection import inspect as sa_inspect        
         # def asdict_columns(obj) -> dict[str, Any]:
         #     insp = sa_inspect(obj)
         #     # `mapper.column_attrs` = jen sloupce (včetně PK/FK), bez relationshipů
         #     return {attr.key: getattr(obj, attr.key) for attr in insp.mapper.column_attrs}
         first = result[0]
-        print(f"first: {first}")
-        fist_json = dataclasses.asdict(first)
-        print(f"first as dict: {fist_json}")
-        print(f"{first.expires_at=}, {first.user_id=}")
+        # print(f"first: {first}")
+        # fist_json = dataclasses.asdict(first)
+        # print(f"first as dict: {fist_json}")
+        # print(f"{first.expires_at=}, {first.user_id=}")
         current_datetime = datetime.datetime.now(tz=None)
         if first.expires_at and first.expires_at < current_datetime:
             first.is_active = False
@@ -601,6 +668,23 @@ async def chat_completions(
         endpoint="chat",
         routelabel="chat_completions",
     ) 
+
+@app.post("/openai/deployments/{deployment}/embeddings")
+async def embeddings_azure(
+    deployment: str,
+    request: Request,
+    session: Any = Depends(get_session),
+    token_row: Any = Depends(get_token_row)
+):
+    if not token_row:
+        raise HTTPException(status_code=401, detail="Unauthorized API key")
+    request.state.token_row = token_row
+    request.state.session = session
+    return await openai_v1_embeddings_general(
+        request=request,
+        deployment=deployment,
+        routelabel="embeddings"
+    )
 
 # ---------- OpenAI-compatible: /v1/models ----------
 @app.get("/v1/models")
@@ -663,6 +747,22 @@ async def openai_v1_responses(request: Request):
         routelabel="openai_v1_responses"
     )
     
+@app.post("/v1/embeddings")
+@app.post("/embeddings")  # volitelný alias
+async def embeddings_openai(
+    request: Request,
+    session: Any = Depends(get_session),
+    token_row: Any = Depends(get_token_row)
+):
+    if not token_row:
+        raise HTTPException(status_code=401, detail="Unauthorized API key")
+    request.state.token_row = token_row
+    request.state.session = session
+    return await openai_v1_embeddings_general(
+        request=request,
+        deployment=None,
+        routelabel="openai_v1_embeddings"
+    )
 
 @app.get("/healthcheck")
 async def healthcheck():
