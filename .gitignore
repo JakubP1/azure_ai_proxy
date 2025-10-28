@@ -26,3 +26,4 @@
 **/environment.secret.txt
 
 **/.nicegui
+**/proxy.db

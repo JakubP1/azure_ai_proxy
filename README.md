@@ -11,6 +11,72 @@ na Azure OpenAI endpoint. Konfigurace probíhá výhradně přes **environment p
 
 ---
 
+## 🧩 Architektura ASGI aplikace
+
+Celá aplikace je postavená jako modulární **ASGI** systém složený ze tří hlavních částí, které se spojují v souboru `main.py`:
+
+main.py
+├── proxy.py ← hlavní reverzní proxy vrstva (Azure OpenAI ↔ klienti)
+├── management.py ← REST API pro správu API klíčů a usage
+└── gui.py ← NiceGUI frontend + Entra ID (OIDC) přihlášení
+
+### ⚙️ `proxy.py` — Azure OpenAI reverse proxy
+
+- Poskytuje **OpenAI-kompatibilní endpointy** (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) i původní **Azure endpointy** (`/openai/deployments/...`).
+- Přijímá klientské požadavky s vlastním API klíčem vydaným proxy (`Authorization: Bearer ...`).
+- Ověřuje klíč vůči databázi (`ApiKeyModel`) a aplikuje:
+  - **rate limiting**,
+  - **expiration / disable flag**,
+  - **usage logování** (počty tokenů, requestů, stream bytes, cena).
+- K Azure OpenAI přistupuje přes **Key Vault API key provider**:
+  - interní klíč (`AZURE_OPENAI_API_KEY`) je uložen v **Azure Key Vaultu**,  
+  - načítá se pomocí **Managed Identity** (v Azure) nebo **Azure Arc MI** (on-prem),
+  - proxy jej **cacheuje** po dobu `KEY_CACHE_TTL_SECONDS` a **automaticky obnoví** při rotaci nebo chybě `401/403`.
+- Veškerá komunikace je asynchronní (`httpx.AsyncClient`).
+
+---
+
+### 🔐 `management.py` — REST API pro správu klíčů a usage
+
+- Vystavuje interní API pod prefixem `/management/...`.
+- Přihlašování probíhá přes:
+  - **session cookie** (Entra ID token z GUI, uložený v `session_store`),
+  - nebo **Bearer token** (např. při volání z Postmana).
+- Ověření identity (`get_principal`) dekóduje OIDC token pomocí **Entra ID JWKS**.
+- Umožňuje:
+  - 🧾 **Vytvářet API klíče** (včetně expirace a rate-limitů),
+  - ✅ **Aktivovat/deaktivovat klíče**,
+  - 📊 **Získávat usage statistiky** (agregace `hour` / `day`).
+- Každý uživatel má účet (`UserModel`), který se vytvoří automaticky při prvním přihlášení.
+
+---
+
+### 💼 `gui.py` — webové rozhraní (NiceGUI + Entra ID)
+
+- Integruje **NiceGUI** do existujícího FastAPI (`init_gui(app)`).
+- Přihlašování přes **Entra ID (Microsoft Entra / Azure AD)** pomocí knihovny **Authlib**.
+- Uživatel se přihlásí přes `/auth/login`, po úspěchu se vytvoří session cookie (`sid`), která se ukládá do `session_store`.
+- Rozhraní `/mgmt` (NiceGUI frontend):
+  - zobrazuje API klíče (tabulka),
+  - umožňuje vytvářet nové klíče, povolit/zakázat stávající,
+  - zobrazuje **usage grafy** (ECharts, denní agregace),
+  - volá interní API `/management/...` přes `httpx.ASGITransport` (bez vnější sítě).
+
+---
+
+### 🧠 Spojení všeho (`main.py`)
+
+```python
+from azure_proxy.proxy import app
+from azure_proxy.gui import init_gui
+from azure_proxy.management import router as management_router
+
+init_gui(app)
+app.include_router(management_router)
+```
+
+
+
 ## 🔐 Základní principy přístupu
 
 Aplikace `proxy.py` funguje jako reverzní proxy mezi klienty (např. aplikacemi nebo agenty) a službou **Azure OpenAI**.  
