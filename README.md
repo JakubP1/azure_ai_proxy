@@ -15,10 +15,12 @@ na Azure OpenAI endpoint. Konfigurace probíhá výhradně přes **environment p
 
 Celá aplikace je postavená jako modulární **ASGI** systém složený ze tří hlavních částí, které se spojují v souboru `main.py`:
 
+```txt
 main.py
 ├── proxy.py ← hlavní reverzní proxy vrstva (Azure OpenAI ↔ klienti)
 ├── management.py ← REST API pro správu API klíčů a usage
 └── gui.py ← NiceGUI frontend + Entra ID (OIDC) přihlášení
+```
 
 ### ⚙️ `proxy.py` — Azure OpenAI reverse proxy
 
