@@ -299,3 +299,6 @@ docker logs azure-proxy | grep KV
 > [KV] Loaded secret 'AZURE_OPENAI_API_KEY' (expires in 300s)
 ```
 
+```bash
+docker run -d  -p 8880:8000 --name local_azureaiproxy --env-file environment.secret.txt local_azureaiproxy:latest
+```

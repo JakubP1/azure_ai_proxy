@@ -17,7 +17,9 @@ pydantic
 starlette
 strawberry-graphql
 aiodataloader
+aiosqlite
 pyjwt[crypto]
+python-jose
 
 nicegui
 fastmcp
@@ -25,4 +27,7 @@ openai
 
 pyinstrument
 prometheus_client
-https://github.com/hrbolek/uoishelpers/archive/refs/heads/main.zip
+# https://github.com/hrbolek/uoishelpers/archive/refs/heads/main.zip
+
+azure-identity 
+azure-keyvault-secrets
